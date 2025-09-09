@@ -12,7 +12,7 @@
           ip_address: "{{ panorama_host }}"
           username: '{{ username | default(omit) }}'
           password: '{{ password | default(omit) }}'
-          api_key: '{{ api_key | default(omit) }}'
+          #api_key: '{{ api_key | default(omit) }}'
           vsys: '{{ vsys | default(omit) }}'
             #serial_number: "{{ serial_number }}"
     no_log: true
