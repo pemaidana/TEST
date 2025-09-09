@@ -1,0 +1,8 @@
+pan-os-python>=1.8
+pan-python>=0.17
+panos-upgrade-assurance==1.5.0
+xmltodict>=0.12
+jmespath>=1
+ansible>=6
+lxml>=4.9
+markdown-it-py>=3.0.0
