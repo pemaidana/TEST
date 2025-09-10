@@ -1,0 +1,356 @@
+- hosts: 'all'
+  strategy: linear
+  connection: local
+  gather_facts: false
+  tasks:
+
+  - name: 'providers : set target host information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+          vsys: '{{ vsys | default(omit) }}'
+            #serial_number: "{{ serial_number }}"
+    no_log: true
+
+  - name: 'Set IP Regex Strings'
+    ansible.builtin.set_fact:
+      ip_to_remove_regex: "^{{ ip_to_remove | regex_escape() }}/32$|^{{ ip_to_remove | regex_escape() }}$" 
+
+  - name: 'Display IP Regex'
+    ansible.builtin.debug:
+      msg: "{{ ip_to_remove_regex }}"
+
+  - name: Get Device Groups
+    paloaltonetworks.panos.panos_device_group:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: '*'
+    register: device_groups
+
+  - name: Add shared to Device Groups
+    ansible.builtin.set_fact:
+      device_groups: "{{ device_groups.gathered + [{'name': 'shared'}] }}"
+
+  - name: Show Found Device Groups
+    ansible.builtin.debug:
+      msg: "{{ device_groups | json_query('[].name') | default([]) }}"
+
+  - name: Get Address Objects
+    paloaltonetworks.panos.panos_address_object:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: >-
+        value matches-regex {{ ip_to_remove_regex }}
+      device_group: "{{ item.name }}"
+    register: address_objects
+    loop: "{{ device_groups }}"
+
+  - name: Found Objets
+    ansible.builtin.debug:
+      msg: "{{ address_objects.results | json_query('[].gathered[].name') | default([]) }}"
+
+  - name: 'Set Addresses Regex Strings'
+    ansible.builtin.set_fact:
+      address_objects_to_remove_regex: >-
+        {{ address_objects.results | json_query('[].gathered[].name') | default([]) | map('regex_escape') | join('|') }}
+
+  - name: 'Addresses objects regex'
+    ansible.builtin.debug:
+      msg: "{{ address_objects_to_remove_regex }}"
+
+  - name: Get Address Groups
+    paloaltonetworks.panos.panos_address_group:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: >-
+        static_value contains-regex {{ address_objects_to_remove_regex }}
+      device_group: "{{ item.name }}"
+    register: address_groups
+    loop: "{{ device_groups }}"
+
+  - name: Found Groups
+    ansible.builtin.debug:
+      msg: "{{ address_groups.results | json_query('[].gathered[].name') | default([]) }}"
+
+  - name: Register Group Edits
+    ansible.builtin.set_fact:
+      edited_address_groups: >
+        [
+          {% for result in address_groups.results %}
+            {% for group in result.gathered %}
+              {% set new_group = group.copy() %}
+
+              {% set new_static_value = new_group.static_value | default([]) | reject('search', address_objects_to_remove_regex) | list %}
+
+              {% set _ = new_group.update({'static_value': new_static_value}) %}
+
+              {% set edit_action = 'edit' if new_static_value | length > 0 else 'delete' %}
+              {% set _ = new_group.update({'edit_action': edit_action}) %}
+
+              {% set _ = new_group.update({'device_group': result.item.name}) %}
+
+              {{ new_group | to_json }}
+              {% if not loop.last %},{% endif %}
+            {% endfor %}
+          {% endfor %}
+        ]
+
+  - name: Register groups that will be deleted
+    set_fact:
+      groups_to_delete: "{{ edited_address_groups | selectattr('edit_action', 'equalto', 'delete') | map(attribute='name') | list }}"
+
+  - name: 'Set Combined Regex (IP + Address Objects + Deleted Groups)'
+    ansible.builtin.set_fact:
+      # combined_ip_and_address_to_remove_regex: "^({{ address_objects_to_remove_regex }})|{{ groups_to_delete | join('|') }}$|^{{ ip_to_remove_regex }}$|^{{ ip_to_remove_regex }}/32$"
+      combined_ip_and_address_to_remove_regex: >-
+        ^{{ ((address_objects.results | json_query('[].gathered[].name') | default([])) + groups_to_delete + [ip_to_remove, ip_to_remove ~ '/32']) | join('|') }}$
+
+  - name: Get security rules
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: >-
+        destination_ip contains-regex {{ combined_ip_and_address_to_remove_regex }} or
+        source_ip contains-regex {{ combined_ip_and_address_to_remove_regex }}
+      device_group: "{{ item.name }}"
+    register: sec_rules
+    loop: "{{ device_groups }}"
+
+  - name: Found rules
+    ansible.builtin.debug:
+      msg: "{{ sec_rules.results | json_query('[].gathered[].rule_name') | default([]) }}"
+  - name: Get NAT rules
+    paloaltonetworks.panos.panos_nat_rule2:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: >-
+        source_addresses contains-regex {{ combined_ip_and_address_to_remove_regex }} or
+        destination_addresses contains-regex {{ combined_ip_and_address_to_remove_regex }}
+      device_group: "{{ item.name  }}"
+    register: nat_rules
+    loop: "{{ device_groups }}"
+
+  - name: Found NAT rules
+    ansible.builtin.debug:
+      msg: "{{ nat_rules.results | json_query('[].gathered[].name') | default([]) }}"
+
+  - name: Register Config Editions
+    ansible.builtin.set_fact:
+      edited_security_rules: >
+        [
+          {% for result in sec_rules.results %}
+            {% for rule in result.gathered %}
+              {% set new_rule = rule.copy() %}
+
+              {% set new_destination_ip = new_rule.destination_ip | default([]) | reject('search', combined_ip_and_address_to_remove_regex) | list %}
+              {% set new_source_ip = new_rule.source_ip | default([]) | reject('search', combined_ip_and_address_to_remove_regex) | list %}
+
+              {% set _ = new_rule.update({'destination_ip': new_destination_ip}) %}
+              {% set _ = new_rule.update({'source_ip': new_source_ip}) %}
+
+              {% set edit_action = 'edit' if new_destination_ip | length > 0 and new_source_ip | length > 0 else 'delete' %}
+              {% set _ = new_rule.update({'edit_action': edit_action}) %}
+
+              {% set _ = new_rule.update({'device_group': result.item.name}) %}
+
+              {{ new_rule | to_json }}
+              {% if not loop.last %},{% endif %}
+            {% endfor %}
+          {% endfor %}
+        ]
+
+      edited_nat_rules: >
+        [
+          {% for result in nat_rules.results %}
+            {% for rule in result.gathered %}
+              {% set new_rule = rule.copy() %}
+
+              {% set new_destination_addresses = new_rule.destination_addresses | default([]) | reject('search', combined_ip_and_address_to_remove_regex) | list %}
+              {% set new_source_addresses = new_rule.source_addresses | default([]) | reject('search', combined_ip_and_address_to_remove_regex) | list %}
+
+              {% set _ = new_rule.update({'destination_addresses': new_destination_addresses}) %}
+              {% set _ = new_rule.update({'source_addresses': new_source_addresses}) %}
+
+              {% set edit_action = 'edit' if new_destination_addresses | length > 0 and new_source_addresses | length > 0 else 'delete' %}
+              {% set _ = new_rule.update({'edit_action': edit_action}) %}
+
+              {% set _ = new_rule.update({'device_group': result.item.name}) %}
+
+              {{ new_rule | to_json }}
+              {% if not loop.last %},{% endif %}
+            {% endfor %}
+          {% endfor %}
+        ]
+
+  - name: Show Address Groups Edits
+    ansible.builtin.debug:
+      msg: "{{ item.edit_action }} - {{ item.device_group }} - {{ item.name }}"
+    loop: "{{ edited_address_groups }}"
+    loop_control:
+      label: "{{ item.name }}"
+
+  - name: Show Security Rules Edits
+    ansible.builtin.debug:
+      msg: "{{ item.edit_action }} - {{ item.device_group }} - {{ item.rule_name }}"
+    loop: "{{ edited_security_rules }}"
+    loop_control:
+      label: "{{ item.rule_name }}"
+
+  - name: Show NAT Rules Edits
+    ansible.builtin.debug:
+      msg: "{{ item.edit_action }} - {{ item.device_group }} - {{ item.name }}"
+    loop: "{{ edited_nat_rules }}"
+    loop_control:
+      label: "{{ item.name }}"
+
+  - name: Delete security rule when 'edit_action' is 'delete'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: "{{ target_device.provider }}"
+      state: absent
+      device_group: "{{ item.device_group }}"
+      rule_name: "{{ item.rule_name }}"
+    loop: "{{ edited_security_rules }}"
+    when: item.edit_action == 'delete'
+
+  - name: Edit security rule when 'edit_action' is 'edit'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ item.device_group }}"
+      rule_name: "{{ item.rule_name }}"
+      action: "{{ item.action | default(omit, true) }}"
+      antivirus: "{{ item.antivirus | default(omit, true) }}"
+      application: "{{ item.application | default(omit, true) }}"
+      audit_comment: "Edited by Ansible"
+      category: "{{ item.category | default(omit, true) }}"
+      data_filtering: "{{ item.data_filtering | default(omit, true) }}"
+      description: "{{ item.description | default(omit, true) }}"
+      destination_ip: "{{ item.destination_ip | default(omit, true) }}"
+      destination_zone: "{{ item.destination_zone | default(omit, true) }}"
+      disable_server_response_inspection: "{{ item.disable_server_response_inspection | default(omit, true) }}"
+      file_blocking: "{{ item.file_blocking | default(omit, true) }}"
+      group_profile: "{{ item.group_profile | default(omit, true) }}"
+      group_tag: "{{ item.group_tag | default(omit, true) }}"
+      hip_profiles: "{{ item.hip_profiles | default(omit, true) }}"
+      icmp_unreachable: "{{ item.icmp_unreachable | default(omit, true) }}"
+      log_end: "{{ item.log_end | default(omit, true) }}"
+      log_setting: "{{ item.log_setting | default(omit, true) }}"
+      log_start: "{{ item.log_start | default(omit, true) }}"
+      negate_destination: "{{ item.negate_destination | default(omit, true) }}"
+      negate_source: "{{ item.negate_source | default(omit, true) }}"
+      negate_target: "{{ item.negate_target | default(omit, true) }}"
+      rule_type: "{{ item.rule_type | default(omit, true) }}"
+      schedule: "{{ item.schedule | default(omit, true) }}"
+      service: "{{ item.service | default(omit, true) }}"
+      source_ip: "{{ item.source_ip | default(omit, true) }}"
+      source_user: "{{ item.source_user | default(omit, true) }}"
+      source_zone: "{{ item.source_zone | default(omit, true) }}"
+      spyware: "{{ item.spyware | default(omit, true) }}"
+      tag_name: "{{ item.tag_name | default(omit, true) }}"
+      target: "{{ item.target | default(omit, true) }}"
+      url_filtering: "{{ item.url_filtering | default(omit, true) }}"
+      vulnerability: "{{ item.vulnerability | default(omit, true) }}"
+      wildfire_analysis: "{{ item.wildfire_analysis | default(omit, true) }}"
+    loop: "{{ edited_security_rules }}"
+    when: item.edit_action == 'edit'
+
+  - name: Delete NAT rule when 'edit_action' is 'delete'
+    paloaltonetworks.panos.panos_nat_rule:
+      provider: "{{ target_device.provider }}"
+      state: absent
+      device_group: "{{ item.device_group }}"
+      name: "{{ item.name }}"
+    loop: "{{ edited_nat_rules }}"
+    when: item.edit_action == 'delete'
+
+
+  - name: Edit NAT rule when 'edit_action' is 'edit'
+    paloaltonetworks.panos.panos_nat_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ item.device_group }}"
+      name: "{{ item.name }}"
+      nat_type: "{{ item.nat_type | default(omit, true) }}"
+      rulebase: "{{ item.rulebase | default(omit, true) }}"
+      audit_comment: "Edited by Ansible"
+      description: "{{ item.description | default(omit, true) }}"
+      destination_addresses: "{{ item.destination_addresses | default(omit, true) }}"
+      destination_dynamic_translated_address: "{{ item.destination_dynamic_translated_address | default(omit, true) }}"
+      destination_dynamic_translated_distribution: "{{ item.destination_dynamic_translated_distribution | default(omit, true) }}"
+      destination_dynamic_translated_port: "{{ item.destination_dynamic_translated_port | default(omit, true) }}"
+      destination_translated_address: "{{ item.destination_translated_address | default(omit, true) }}"
+      destination_translated_port: "{{ item.destination_translated_port | default(omit, true) }}"
+      from_zones: "{{ item.from_zones | default(omit, true) }}"
+      group_tag: "{{ item.group_tag | default(omit, true) }}"
+      ha_binding: "{{ item.ha_binding | default(omit, true) }}"
+      negate_target: "{{ item.negate_target | default(omit, true) }}"
+      service: "{{ item.service | default(omit, true) }}"
+      source_addresses: "{{ item.source_addresses | default(omit, true) }}"
+      source_translation_address_type: "{{ item.source_translation_address_type | default(omit, true) }}"
+      source_translation_fallback_interface: "{{ item.source_translation_fallback_interface | default(omit, true) }}"
+      source_translation_fallback_ip_address: "{{ item.source_translation_fallback_ip_address | default(omit, true) }}"
+      source_translation_fallback_ip_type: "{{ item.source_translation_fallback_ip_type | default(omit, true) }}"
+      source_translation_fallback_translated_addresses: "{{ item.source_translation_fallback_translated_addresses | default(omit, true) }}"
+      source_translation_fallback_type: "{{ item.source_translation_fallback_type | default(omit, true) }}"
+      source_translation_interface: "{{ item.source_translation_interface | default(omit, true) }}"
+      source_translation_ip_address: "{{ item.source_translation_ip_address | default(omit, true) }}"
+      source_translation_static_bi_directional: "{{ item.source_translation_static_bi_directional | default(omit, true) }}"
+      source_translation_static_translated_address: "{{ item.source_translation_static_translated_address | default(omit, true) }}"
+      source_translation_translated_addresses: "{{ item.source_translation_translated_addresses | default(omit, true) }}"
+      source_translation_type: "{{ item.source_translation_type | default(omit, true) }}"
+      tags: "{{ item.tags | default(omit, true) }}"
+      target: "{{ item.target | default(omit, true) }}"
+      to_interface: "{{ item.to_interface | default(omit, true) }}"
+      to_zones: "{{ item.to_zones | default(omit, true) }}"
+    loop: "{{ edited_security_rules }}"
+    when: item.edit_action == 'edit'
+
+  - name: Delete Addresses Groups when 'edit_action' is 'delete'
+    paloaltonetworks.panos.panos_address_group:
+      provider: "{{ target_device.provider }}"
+      state: absent
+      device_group: "{{ item.device_group }}"
+      name: "{{ item.name }}"
+    loop: "{{ edited_address_groups }}"
+    when: item.edit_action == 'delete'
+  
+  - name: Edit Addresses Groups rule when 'edit_action' is 'edit'
+    paloaltonetworks.panos.panos_address_group:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ item.device_group }}"
+      name: "{{ item.name }}"
+      description: "{{ item.description | default(omit, true) }}"
+      static_value: "{{ item.static_value | default(omit, true) }}"
+      tag: "{{ item.tag | default(omit, true) }}"
+    loop: "{{ edited_address_groups }}"
+    when: item.edit_action == 'edit'
+
+  - name: Delete Addresses when 'edit_action' is 'delete'
+    paloaltonetworks.panos.panos_address_object:
+      provider: "{{ target_device.provider }}"
+      state: absent
+      device_group: "{{ item.device_group }}"
+      name: "{{ item.name }}"
+    loop: "{{ address_objects.results | json_query('[].gathered[].name') | default([]) }}"
+    when: item.edit_action == 'delete'
+
+  - name: commit changes by specified admins on firewall
+    paloaltonetworks.panos.panos_commit_panorama:
+      provider: "{{ target_device.provider }}"
+      # admins: ['netops', 'secops', 'cloudops'] # Change it to the ansible user if available
+      description: 'Decom playbook' # We can include the SNOW RITM
+  
+  # Disabled to be enabled during test meeting
+  # - name: push device group configs
+  #   paloaltonetworks.panos.panos_commit_push:
+  #     provider: "{{ target_device.provider }}"
+  #     style: 'device group'
+  #     name: "{{ item }}"
+  #     description: 'Decom playbook' # We can include the SNOW RITM
+  #   loop: "{{ device_groups | json_query('[].name') | default([]) }}"
