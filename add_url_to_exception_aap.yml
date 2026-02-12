@@ -1,0 +1,110 @@
+---
+# Playbook for Ansible Automation Platform (AAP/Tower)
+# Job Template Configuration Required:
+# - Network Credential: Attach a Network credential with Panorama username/password
+# - Extra Variables in Job Template:
+#     url_exception_list: "prod-url-except"
+#     device_group_select: "shared"
+#     url_to_add: "example.com"  # or prompt user for this variable
+# - Survey (optional): Create a survey to prompt for url_to_add
+
+- hosts: 'all'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    # These variables will be provided by AAP Job Template Extra Variables
+    # url_exception_list: "prod-url-except"
+    # device_group_select: "shared"
+    # url_to_add: "example.com"  # Can be set in Job Template or via Survey
+
+  tasks:
+
+  - name: 'Validate that url_to_add parameter is provided'
+    ansible.builtin.fail:
+      msg: "ERROR: Please provide the URL to add via Job Template Extra Variables or Survey"
+    when: url_to_add is not defined or url_to_add == ""
+
+  - name: 'Validate required variables are set'
+    ansible.builtin.fail:
+      msg: "ERROR: Required variables url_exception_list and device_group_select must be set in Job Template Extra Variables"
+    when: url_exception_list is not defined or device_group_select is not defined
+
+  - name: 'providers : set target host information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ ansible_host | default(panorama_host) }}"
+          username: '{{ ansible_user | default(ansible_ssh_user) }}'
+          password: '{{ ansible_password | default(ansible_ssh_pass) }}'
+    no_log: true
+
+  - name: 'Get current URL exception list from Panorama'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: 'name == {{ url_exception_list }}'
+      device_group: "{{ device_group_select }}"
+    register: url_category_info
+
+  - name: 'Extract current URL list'
+    ansible.builtin.set_fact:
+      current_url_list: "{{ url_category_info.gathered[0].url_value | default([]) }}"
+    when: url_category_info.gathered is defined and url_category_info.gathered | length > 0
+
+  - name: 'Set empty list if URL category does not exist'
+    ansible.builtin.set_fact:
+      current_url_list: []
+    when: url_category_info.gathered is not defined or url_category_info.gathered | length == 0
+
+  - name: 'Display current URL list'
+    ansible.builtin.debug:
+      msg: "Current URLs in exception list ({{ current_url_list | length }}): {{ current_url_list }}"
+
+  - name: 'Check if URL already exists in the exception list'
+    ansible.builtin.set_fact:
+      url_exists: "{{ url_to_add in current_url_list }}"
+
+  - name: 'Display message if URL already exists'
+    ansible.builtin.debug:
+      msg: "The URL '{{ url_to_add }}' already exists in the PROD URL EXCEPTION LIST."
+    when: url_exists | bool
+
+  - name: 'End playbook if URL already exists'
+    ansible.builtin.meta: end_play
+    when: url_exists | bool
+
+  - name: 'Add URL to the exception list'
+    ansible.builtin.set_fact:
+      updated_url_list: "{{ current_url_list + [url_to_add] }}"
+    when: not (url_exists | bool)
+
+  - name: 'Display updated URL list'
+    ansible.builtin.debug:
+      msg: "Updated URL list ({{ updated_url_list | length }}): {{ updated_url_list }}"
+    when: not (url_exists | bool)
+
+  - name: 'Update URL category on Panorama'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ device_group_select }}"
+      name: "{{ url_exception_list }}"
+      type: "URL List"
+      url_value: "{{ updated_url_list }}"
+    register: update_result
+    when: not (url_exists | bool)
+
+  - name: 'Commit changes to Panorama'
+    paloaltonetworks.panos.panos_commit_panorama:
+      provider: "{{ target_device.provider }}"
+      description: "Added URL '{{ url_to_add }}' to {{ url_exception_list }} via AAP"
+    register: commit_result
+    when: not (url_exists | bool)
+
+  - name: 'Display final success message'
+    ansible.builtin.debug:
+      msg: "URL '{{ url_to_add }}' added to the URL EXCEPTION LIST."
+    when: not (url_exists | bool)
