@@ -31,14 +31,35 @@
       msg: "ERROR: Required variables url_exception_list and device_group_select must be set in Job Template Extra Variables"
     when: url_exception_list is not defined or device_group_select is not defined
 
+  - name: 'Debug credential variables (only if debug_credentials is true)'
+    ansible.builtin.debug:
+      msg:
+        - "ansible_host: {{ ansible_host | default('NOT SET') }}"
+        - "ansible_user: {{ ansible_user | default('NOT SET') }}"
+        - "ansible_password: {{ 'SET' if ansible_password is defined else 'NOT SET' }}"
+        - "inventory_hostname: {{ inventory_hostname }}"
+    when: debug_credentials | default(false) | bool
+
+  - name: 'Set credentials from AAP Network Credential or fallback'
+    ansible.builtin.set_fact:
+      panos_ip: "{{ ansible_host | default(panorama_host | default('')) }}"
+      panos_username: "{{ ansible_user | default(username | default('')) }}"
+      panos_password: "{{ ansible_password | default(password | default('')) }}"
+    no_log: true
+
+  - name: 'Validate credentials are available'
+    ansible.builtin.fail:
+      msg: "ERROR: Missing credentials. Ensure Network Credential is attached to Job Template or provide username/password variables."
+    when: panos_ip == '' or panos_username == '' or panos_password == ''
+
   - name: 'providers : set target host information'
     ansible.builtin.set_fact:
       target_device:
         name: '{{ inventory_hostname }}'
         provider:
-          ip_address: "{{ ansible_host | default(panorama_host) }}"
-          username: '{{ ansible_user | default(ansible_ssh_user) }}'
-          password: '{{ ansible_password | default(ansible_ssh_pass) }}'
+          ip_address: "{{ panos_ip }}"
+          username: "{{ panos_username }}"
+          password: "{{ panos_password }}"
     no_log: true
 
   - name: 'Get current URL exception list from Panorama'
