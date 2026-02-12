@@ -25,7 +25,7 @@
           username: '{{ username | default(omit) }}'
           password: '{{ password | default(omit) }}'
           api_key: '{{ api_key | default(omit) }}'
-    no_log: true
+    no_log: false
 
   - name: 'Get current URL exception list from Panorama'
     paloaltonetworks.panos.panos_custom_url_category:
