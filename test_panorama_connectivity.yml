@@ -1,0 +1,81 @@
+---
+# Test connectivity from AAP to Panorama
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    panorama_ip: "34.95.255.117"
+    panorama_port: 443
+
+  tasks:
+
+  - name: 'Test ICMP ping to Panorama'
+    ansible.builtin.command:
+      cmd: "ping -c 4 {{ panorama_ip }}"
+    register: ping_result
+    ignore_errors: true
+
+  - name: 'Display ping result'
+    ansible.builtin.debug:
+      msg: "{{ ping_result.stdout_lines }}"
+    when: ping_result.rc == 0
+
+  - name: 'Ping failed'
+    ansible.builtin.debug:
+      msg: "Ping failed - ICMP may be blocked"
+    when: ping_result.rc != 0
+
+  - name: 'Test TCP connection to Panorama HTTPS port'
+    ansible.builtin.wait_for:
+      host: "{{ panorama_ip }}"
+      port: "{{ panorama_port }}"
+      timeout: 10
+      state: started
+    register: tcp_test
+    ignore_errors: true
+
+  - name: 'TCP connection successful'
+    ansible.builtin.debug:
+      msg: "SUCCESS: AAP can reach Panorama at {{ panorama_ip }}:{{ panorama_port }}"
+    when: tcp_test is succeeded
+
+  - name: 'TCP connection failed'
+    ansible.builtin.debug:
+      msg: "FAILED: AAP cannot reach Panorama at {{ panorama_ip }}:{{ panorama_port }}"
+    when: tcp_test is failed
+
+  - name: 'Test DNS resolution'
+    ansible.builtin.command:
+      cmd: "nslookup {{ panorama_ip }}"
+    register: dns_result
+    ignore_errors: true
+
+  - name: 'Check route to Panorama'
+    ansible.builtin.command:
+      cmd: "traceroute -m 10 {{ panorama_ip }}"
+    register: trace_result
+    ignore_errors: true
+    async: 30
+    poll: 5
+
+  - name: 'Display traceroute'
+    ansible.builtin.debug:
+      msg: "{{ trace_result.stdout_lines }}"
+    when: trace_result.rc == 0
+
+  - name: 'Test HTTPS with curl'
+    ansible.builtin.uri:
+      url: "https://{{ panorama_ip }}"
+      validate_certs: false
+      timeout: 10
+      status_code: [-1, 200, 301, 302, 400, 401, 403, 404]
+    register: https_test
+    ignore_errors: true
+
+  - name: 'HTTPS test result'
+    ansible.builtin.debug:
+      msg:
+        - "HTTPS Status: {{ https_test.status | default('Failed to connect') }}"
+        - "Can establish HTTPS: {{ 'Yes' if https_test is succeeded else 'No' }}"
+
