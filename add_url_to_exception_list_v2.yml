@@ -1,0 +1,126 @@
+---
+- hosts: 'all'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    url_exception_list: "prod-url-except"
+    device_group_select: "shared"
+    # url_to_add: "example.com"  # Can be a single URL or a list of URLs
+    # url_to_add: ["url1.com", "url2.com", "url3.com"]  # List format
+
+  tasks:
+
+  - name: 'Validate that url_to_add parameter is provided'
+    ansible.builtin.fail:
+      msg: "ERROR: Please provide the URL(s) to add using -e 'url_to_add=your-url.com' or -e 'url_to_add=[\"url1.com\",\"url2.com\"]'"
+    when: url_to_add is not defined or url_to_add == "" or url_to_add == []
+
+  - name: 'Normalize url_to_add to a list (if single string provided)'
+    ansible.builtin.set_fact:
+      urls_to_process: "{{ [url_to_add] if url_to_add is string else url_to_add }}"
+
+  - name: 'Display URLs to process'
+    ansible.builtin.debug:
+      msg: "URLs to process ({{ urls_to_process | length }}): {{ urls_to_process }}"
+
+  - name: 'providers : set target host information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+    no_log: true
+
+  - name: 'Get current URL exception list from Panorama'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: 'name == {{ url_exception_list }}'
+      device_group: "{{ device_group_select }}"
+    register: url_category_info
+
+  - name: 'Extract current URL list'
+    ansible.builtin.set_fact:
+      current_url_list: "{{ url_category_info.gathered[0].url_value | default([]) }}"
+    when: url_category_info.gathered is defined and url_category_info.gathered | length > 0
+
+  - name: 'Set empty list if URL category does not exist'
+    ansible.builtin.set_fact:
+      current_url_list: []
+    when: url_category_info.gathered is not defined or url_category_info.gathered | length == 0
+
+  - name: 'Display current URL list'
+    ansible.builtin.debug:
+      msg: "Current URLs in exception list ({{ current_url_list | length }}): {{ current_url_list }}"
+
+  - name: 'Initialize lists for tracking'
+    ansible.builtin.set_fact:
+      urls_already_exist: []
+      urls_to_add_list: []
+
+  - name: 'Check each URL and categorize'
+    ansible.builtin.set_fact:
+      urls_already_exist: "{{ urls_already_exist + [item] }}"
+    loop: "{{ urls_to_process }}"
+    when: item in current_url_list
+
+  - name: 'Build list of URLs to add (excluding duplicates)'
+    ansible.builtin.set_fact:
+      urls_to_add_list: "{{ urls_to_add_list + [item] }}"
+    loop: "{{ urls_to_process }}"
+    when: item not in current_url_list
+
+  - name: 'Display URLs that already exist'
+    ansible.builtin.debug:
+      msg: "The following URLs already exist in the PROD URL EXCEPTION LIST ({{ urls_already_exist | length }}): {{ urls_already_exist }}"
+    when: urls_already_exist | length > 0
+
+  - name: 'Display URLs to be added'
+    ansible.builtin.debug:
+      msg: "The following URLs will be added to the PROD URL EXCEPTION LIST ({{ urls_to_add_list | length }}): {{ urls_to_add_list }}"
+    when: urls_to_add_list | length > 0
+
+  - name: 'Display message if no new URLs to add'
+    ansible.builtin.debug:
+      msg: "All provided URLs already exist in the PROD URL EXCEPTION LIST. No changes needed."
+    when: urls_to_add_list | length == 0
+
+  - name: 'End playbook if no new URLs to add'
+    ansible.builtin.meta: end_play
+    when: urls_to_add_list | length == 0
+
+  - name: 'Create updated URL list with new URLs'
+    ansible.builtin.set_fact:
+      updated_url_list: "{{ current_url_list + urls_to_add_list }}"
+
+  - name: 'Display updated URL list'
+    ansible.builtin.debug:
+      msg: "Updated URL list will contain ({{ updated_url_list | length }}) URLs: {{ updated_url_list }}"
+
+  - name: 'Update URL category on Panorama'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ device_group_select }}"
+      name: "{{ url_exception_list }}"
+      type: "URL List"
+      url_value: "{{ updated_url_list }}"
+    register: update_result
+
+  - name: 'Commit changes to Panorama'
+    paloaltonetworks.panos.panos_commit_panorama:
+      provider: "{{ target_device.provider }}"
+      description: "Added {{ urls_to_add_list | length }} URL(s) to {{ url_exception_list }} via Ansible: {{ urls_to_add_list | join(', ') }}"
+    register: commit_result
+
+  - name: 'Display final success message'
+    ansible.builtin.debug:
+      msg:
+        - "SUCCESS: Added {{ urls_to_add_list | length }} URL(s) to the URL EXCEPTION LIST"
+        - "URLs added: {{ urls_to_add_list }}"
+        - "Total URLs in exception list: {{ updated_url_list | length }}"
