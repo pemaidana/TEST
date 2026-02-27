@@ -1,0 +1,117 @@
+---
+- hosts: 'all'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Default values - can be overridden with -e
+    device_group: "example-device-group"
+    rule_name: "test-rule001"
+    source_zone: ["any"]
+    source_address: ["any"]
+    source_user: ["pedro"]
+    destination_zone: ["any"]
+    destination_address: ["any"]
+    application: ["web-browsing"]
+    service: ["application-default"]
+    url_category: ["prod-url-except"]
+    action: "allow"
+    rule_description: "Security rule created via Ansible"
+
+  tasks:
+
+  - name: 'Validate required parameters'
+    ansible.builtin.fail:
+      msg: "ERROR: Rule name must be provided"
+    when: rule_name is not defined or rule_name == ""
+
+  - name: 'Set target device provider information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+    no_log: true
+
+  - name: 'Display rule configuration to be created'
+    ansible.builtin.debug:
+      msg:
+        - "Creating Security Policy Rule:"
+        - "  Device Group: {{ device_group }}"
+        - "  Rule Name: {{ rule_name }}"
+        - "  Source Zone: {{ source_zone }}"
+        - "  Source Address: {{ source_address }}"
+        - "  Source User: {{ source_user }}"
+        - "  Destination Zone: {{ destination_zone }}"
+        - "  Destination Address: {{ destination_address }}"
+        - "  Application: {{ application }}"
+        - "  Service: {{ service }}"
+        - "  URL Category: {{ url_category }}"
+        - "  Action: {{ action }}"
+
+  - name: 'Check if security rule already exists'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: 'rule_name == {{ rule_name }}'
+      device_group: "{{ device_group }}"
+    register: existing_rule
+    ignore_errors: true
+
+  - name: 'Display warning if rule already exists'
+    ansible.builtin.debug:
+      msg: "WARNING: Rule '{{ rule_name }}' already exists in device group '{{ device_group }}'"
+    when: existing_rule.gathered is defined and existing_rule.gathered | length > 0
+
+  - name: 'End playbook if rule already exists'
+    ansible.builtin.meta: end_play
+    when: existing_rule.gathered is defined and existing_rule.gathered | length > 0
+
+  - name: 'Create security policy rule on Panorama'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ device_group }}"
+      rule_name: "{{ rule_name }}"
+      description: "{{ rule_description }}"
+      source_zone: "{{ source_zone }}"
+      source_ip: "{{ source_address }}"
+      source_user: "{{ source_user }}"
+      destination_zone: "{{ destination_zone }}"
+      destination_ip: "{{ destination_address }}"
+      application: "{{ application }}"
+      service: "{{ service }}"
+      category: "{{ url_category }}"
+      action: "{{ action }}"
+      log_end: true
+    register: rule_result
+
+  - name: 'Display rule creation result'
+    ansible.builtin.debug:
+      msg: "Security rule '{{ rule_name }}' created successfully in device group '{{ device_group }}'"
+    when: rule_result is succeeded
+
+  - name: 'Commit changes to Panorama'
+    paloaltonetworks.panos.panos_commit_panorama:
+      provider: "{{ target_device.provider }}"
+      description: "Created security rule '{{ rule_name }}' in {{ device_group }} via Ansible"
+    register: commit_result
+
+  - name: 'Display commit result'
+    ansible.builtin.debug:
+      msg:
+        - "Changes committed successfully to Panorama"
+        - "Security rule '{{ rule_name }}' is now active"
+    when: commit_result is succeeded
+
+  - name: 'Display final summary'
+    ansible.builtin.debug:
+      msg:
+        - "=== Security Policy Creation Complete ==="
+        - "Rule Name: {{ rule_name }}"
+        - "Device Group: {{ device_group }}"
+        - "Status: Successfully created and committed"
