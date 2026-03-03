@@ -1,0 +1,234 @@
+---
+- hosts: 'all'
+  strategy: linear
+  connection: local
+  gather_facts: false
+
+  vars:
+    # Default values - can be overridden with -e
+    device_group: "example-device-group"
+    ticket_number: "SR12345"  # Will be used for rule name and URL category name
+    source_zone: ["any"]
+    source_address: ["any"]
+    source_user: ["pedro"]
+    destination_zone: ["any"]
+    destination_address: ["any"]
+    application: ["web-browsing"]
+    service: ["application-default"]
+    action: "allow"
+    rule_description: "Security rule created via Ansible"
+    # url_to_add: "example.com"  # Can be a single URL or a list of URLs
+    # url_to_add: ["url1.com", "url2.com", "url3.com"]  # List format
+
+  tasks:
+
+  - name: 'Validate required parameters'
+    ansible.builtin.fail:
+      msg: "ERROR: {{ item.msg }}"
+    when: item.condition
+    loop:
+      - { condition: "{{ ticket_number is not defined or ticket_number == '' }}", msg: "ticket_number must be provided" }
+      - { condition: "{{ url_to_add is not defined or url_to_add == '' or url_to_add == [] }}", msg: "Please provide URL(s) to add using -e 'url_to_add=your-url.com' or -e 'url_to_add=[\"url1.com\",\"url2.com\"]'" }
+    loop_control:
+      label: "{{ item.msg }}"
+
+  - name: 'Normalize url_to_add to a list (if single string provided)'
+    ansible.builtin.set_fact:
+      urls_to_process: "{{ [url_to_add] if url_to_add is string else url_to_add }}"
+
+  - name: 'Set dynamic names based on ticket_number'
+    ansible.builtin.set_fact:
+      rule_name: "user-allowed-url-{{ ticket_number }}"
+      url_category_name: "prod-url-{{ ticket_number | lower }}"
+
+  - name: 'Display URLs to process'
+    ansible.builtin.debug:
+      msg: "URLs to process ({{ urls_to_process | length }}): {{ urls_to_process }}"
+
+  - name: 'Set target device provider information'
+    ansible.builtin.set_fact:
+      target_device:
+        name: '{{ inventory_hostname }}'
+        provider:
+          ip_address: "{{ panorama_host }}"
+          username: '{{ username | default(omit) }}'
+          password: '{{ password | default(omit) }}'
+          api_key: '{{ api_key | default(omit) }}'
+    no_log: true
+
+  - name: 'Display configuration summary'
+    ansible.builtin.debug:
+      msg:
+        - "=== Configuration Summary ==="
+        - "Ticket Number: {{ ticket_number }}"
+        - "Rule Name: {{ rule_name }}"
+        - "URL Category Name: {{ url_category_name }}"
+        - "Device Group: {{ device_group }}"
+        - "URLs to add: {{ urls_to_process }}"
+
+  # ==========================================
+  # URL Category Creation Section
+  # ==========================================
+
+  - name: 'Check if URL category already exists'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: 'name == {{ url_category_name }}'
+      device_group: "{{ device_group }}"
+    register: url_category_check
+    ignore_errors: true
+
+  - name: 'Display warning if URL category already exists'
+    ansible.builtin.debug:
+      msg: "WARNING: URL Category '{{ url_category_name }}' already exists in device group '{{ device_group }}'"
+    when: url_category_check.gathered is defined and url_category_check.gathered | length > 0
+
+  - name: 'Extract current URL list if category exists'
+    ansible.builtin.set_fact:
+      #current_url_list: "{{ url_category_check.gathered[0].url_value | default([]) }}"
+      current_url_list_raw: "{{ url_category_check.gathered[0].url_value | default([]) }}"
+    when: url_category_check.gathered is defined and url_category_check.gathered | length > 0
+
+  - name: 'Normalize current URL list to ensure it is a list'
+    ansible.builtin.set_fact:
+      current_url_list: "{{ [] if current_url_list_raw is not defined else (current_url_list_raw if current_url_list_raw is iterable and current_url_list_raw is not string else []) }}"
+    when: url_category_check.gathered is defined and url_category_check.gathered | length > 0
+
+  - name: 'Set empty list if URL category does not exist'
+    ansible.builtin.set_fact:
+      current_url_list: []
+    when: url_category_check.gathered is not defined or url_category_check.gathered | length == 0
+
+  - name: 'Initialize lists for tracking'
+    ansible.builtin.set_fact:
+      urls_already_exist: []
+      urls_to_add_list: []
+
+  - name: 'Check each URL and categorize (already exists)'
+    ansible.builtin.set_fact:
+      urls_already_exist: "{{ urls_already_exist + [item] }}"
+    loop: "{{ urls_to_process }}"
+    when: item in current_url_list
+
+  - name: 'Build list of URLs to add (excluding duplicates)'
+    ansible.builtin.set_fact:
+      urls_to_add_list: "{{ urls_to_add_list + [item] }}"
+    loop: "{{ urls_to_process }}"
+    when: item not in current_url_list
+
+  - name: 'Display URLs that already exist'
+    ansible.builtin.debug:
+      msg: "The following URLs already exist in '{{ url_category_name }}' ({{ urls_already_exist | length }}): {{ urls_already_exist }}"
+    when: urls_already_exist | length > 0
+
+  - name: 'Create final URL list (merge existing + new URLs)'
+    ansible.builtin.set_fact:
+      final_url_list: "{{ current_url_list + urls_to_add_list }}"
+
+  - name: 'Display final URL list'
+    ansible.builtin.debug:
+      msg: "Final URL list will contain ({{ final_url_list | length }}) URLs: {{ final_url_list }}"
+
+  - name: 'Create/Update URL category on Panorama'
+    paloaltonetworks.panos.panos_custom_url_category:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ device_group }}"
+      name: "{{ url_category_name }}"
+      type: "URL List"
+      url_value: "{{ final_url_list }}"
+      description: "URL category for ticket {{ ticket_number }}"
+    register: url_category_result
+
+  - name: 'Display URL category creation result'
+    ansible.builtin.debug:
+      msg: "URL Category '{{ url_category_name }}' created/updated successfully with {{ final_url_list | length }} URL(s)"
+    when: url_category_result is succeeded
+
+  # ==========================================
+  # Security Rule Creation Section
+  # ==========================================
+
+  - name: 'Check if security rule already exists'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'gathered'
+      gathered_filter: 'rule_name == {{ rule_name }}'
+      device_group: "{{ device_group }}"
+    register: existing_rule
+    ignore_errors: true
+
+  - name: 'Display warning and skip if rule already exists'
+    ansible.builtin.debug:
+      msg: "WARNING: Security rule '{{ rule_name }}' already exists in device group '{{ device_group }}'. Skipping rule creation."
+    when: existing_rule.gathered is defined and existing_rule.gathered | length > 0
+
+  - name: 'Display rule configuration to be created'
+    ansible.builtin.debug:
+      msg:
+        - "Creating Security Policy Rule:"
+        - "  Device Group: {{ device_group }}"
+        - "  Rule Name: {{ rule_name }}"
+        - "  Source Zone: {{ source_zone }}"
+        - "  Source Address: {{ source_address }}"
+        - "  Source User: {{ source_user }}"
+        - "  Destination Zone: {{ destination_zone }}"
+        - "  Destination Address: {{ destination_address }}"
+        - "  Application: {{ application }}"
+        - "  Service: {{ service }}"
+        - "  URL Category: {{ url_category_name }}"
+        - "  Action: {{ action }}"
+    when: existing_rule.gathered is not defined or existing_rule.gathered | length == 0
+
+  - name: 'Create security policy rule on Panorama'
+    paloaltonetworks.panos.panos_security_rule:
+      provider: '{{ target_device.provider }}'
+      state: 'present'
+      device_group: "{{ device_group }}"
+      rule_name: "{{ rule_name }}"
+      description: "{{ rule_description }} - Ticket: {{ ticket_number }}"
+      source_zone: "{{ source_zone }}"
+      source_ip: "{{ source_address }}"
+      source_user: "{{ source_user }}"
+      destination_zone: "{{ destination_zone }}"
+      destination_ip: "{{ destination_address }}"
+      application: "{{ application }}"
+      service: "{{ service }}"
+      category: ["{{ url_category_name }}"]
+      action: "{{ action }}"
+      log_end: true
+    register: rule_result
+    when: existing_rule.gathered is not defined or existing_rule.gathered | length == 0
+
+  - name: 'Display rule creation result'
+    ansible.builtin.debug:
+      msg: "Security rule '{{ rule_name }}' created successfully in device group '{{ device_group }}'"
+    when: rule_result is succeeded
+
+  # ==========================================
+  # Commit Changes Section
+  # ==========================================
+
+  - name: 'Commit changes to Panorama'
+    paloaltonetworks.panos.panos_commit_panorama:
+      provider: "{{ target_device.provider }}"
+      description: "Created URL category '{{ url_category_name }}' and security rule '{{ rule_name }}' for ticket {{ ticket_number }} via Ansible"
+    register: commit_result
+
+  - name: 'Display commit result'
+    ansible.builtin.debug:
+      msg:
+        - "Changes committed successfully to Panorama"
+    when: commit_result is succeeded
+
+  - name: 'Display final summary'
+    ansible.builtin.debug:
+      msg:
+        - "=== Security Policy Creation Complete ==="
+        - "Ticket Number: {{ ticket_number }}"
+        - "URL Category: {{ url_category_name }}"
+        - "  - URLs: {{ final_url_list }}"
+        - "Security Rule: {{ rule_name }}"
+        - "Device Group: {{ device_group }}"
+        - "Status: Successfully created and committed"
