@@ -51,7 +51,7 @@
 
   - name: 'Normalize current URL list to ensure it is a list'
     ansible.builtin.set_fact:
-      current_url_list: "{{ [current_url_list_raw] if current_url_list_raw is defined and current_url_list_raw is string else (current_url_list_raw | default([])) }}"
+      current_url_list: "{{ [] if current_url_list_raw is not defined else (current_url_list_raw if current_url_list_raw is iterable and current_url_list_raw is not string else []) }}"
     when: url_category_info.gathered is defined and url_category_info.gathered | length > 0
 
   - name: 'Set empty list if URL category does not exist'
